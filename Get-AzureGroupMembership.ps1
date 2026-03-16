@@ -15,7 +15,7 @@
     Azure AD tenant ID (GUID).
 
 .PARAMETER OutputXlsx
-    Final XLSX output path.
+    Output XLSX file name. It will always be created in a local .\results folder.
 
 .PARAMETER ThreadCount
     Number of parallel runspaces. Start with 8, 12, or 16 depending on tenant size and throttling.
@@ -23,7 +23,7 @@
 .EXAMPLE
     .\Export-AzureADSecurityGroupMembers.ps1 `
         -TenantId "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" `
-        -OutputXlsx "C:\Temp\AzureAD_SecurityGroupMembers.xlsx" `
+        -OutputXlsx "AzureAD_SecurityGroupMembers.xlsx" `
         -ThreadCount 12
 #>
 
@@ -41,10 +41,6 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
-
-# ---------------------------
-# Helpers
-# ---------------------------
 
 function Test-ModuleInstalled {
     param(
@@ -76,7 +72,6 @@ function Convert-CsvToXlsx {
         $worksheet = $workbook.Worksheets.Item(1)
         $worksheet.Name = 'GroupMembers'
 
-        # Import CSV into the sheet
         $queryTable = $worksheet.QueryTables.Add("TEXT;$CsvPath", $worksheet.Range("A1"))
         $queryTable.TextFileParseType = 1        # xlDelimited
         $queryTable.TextFileCommaDelimiter = $true
@@ -85,7 +80,6 @@ function Convert-CsvToXlsx {
         $queryTable.Refresh($false)
         $queryTable.Delete()
 
-        # Optional formatting
         $usedRange = $worksheet.UsedRange
         $usedRange.EntireColumn.AutoFit() | Out-Null
 
@@ -110,21 +104,19 @@ function Convert-CsvToXlsx {
     }
 }
 
-# ---------------------------
-# Validation
-# ---------------------------
-
 if (-not (Test-ModuleInstalled -Name 'AzureAD')) {
     throw "AzureAD module is not installed."
 }
 
 Import-Module AzureAD -ErrorAction Stop
 
-# Make sure output folder exists
-$outputFolder = Split-Path -Path $OutputXlsx -Parent
-if (-not [string]::IsNullOrWhiteSpace($outputFolder) -and -not (Test-Path -LiteralPath $outputFolder)) {
-    New-Item -ItemType Directory -Path $outputFolder -Force | Out-Null
-}
+# Always create a "results" folder where the script is executed
+$resultsFolder = Join-Path -Path (Get-Location) -ChildPath "results"
+New-Item -ItemType Directory -Path $resultsFolder -Force | Out-Null
+
+# Force output into .\results using only the provided file name
+$outputFileName = Split-Path -Path $OutputXlsx -Leaf
+$OutputXlsx = Join-Path -Path $resultsFolder -ChildPath $outputFileName
 
 $tempRoot = Join-Path $env:TEMP ("AzureAD_GroupExport_" + [guid]::NewGuid().Guid)
 $tempCsv  = Join-Path $tempRoot "GroupMembers.csv"
@@ -133,31 +125,19 @@ $tempDir  = Join-Path $tempRoot "Chunks"
 New-Item -ItemType Directory -Path $tempRoot -Force | Out-Null
 New-Item -ItemType Directory -Path $tempDir -Force | Out-Null
 
-# ---------------------------
-# Connect once in the main session
-# ---------------------------
-
 Write-Host "Prompting for Azure AD credential..." -ForegroundColor Cyan
 $credential = Get-Credential -Message "Enter Azure AD credential for tenant $TenantId"
 
 Write-Host "Connecting to Azure AD in main session..." -ForegroundColor Cyan
 Connect-AzureAD -TenantId $TenantId -Credential $credential | Out-Null
 
-# ---------------------------
-# Get all security-enabled groups
-# ---------------------------
-# AzureAD/MS cmdlets expose SecurityEnabled on group objects. We use Get-AzureADMSGroup
-# because it returns modern group properties reliably within the AzureAD module family.
-# Filtering client-side avoids relying on endpoint/filter quirks across tenants.
-
 Write-Host "Retrieving all security-enabled groups..." -ForegroundColor Cyan
-
 $groups = Get-AzureADMSGroup -All $true | Where-Object { $_.SecurityEnabled -eq $true }
 
 $groupCount = @($groups).Count
 Write-Host "Found $groupCount security-enabled groups." -ForegroundColor Green
 
-# Create CSV header up front
+# Create CSV header
 "GroupId,MemberId" | Set-Content -LiteralPath $tempCsv -Encoding UTF8
 
 if ($groupCount -eq 0) {
@@ -167,20 +147,12 @@ if ($groupCount -eq 0) {
         Write-Host "Done: $OutputXlsx" -ForegroundColor Green
     }
     catch {
-        Copy-Item -LiteralPath $tempCsv -Destination ([System.IO.Path]::ChangeExtension($OutputXlsx, '.csv')) -Force
-        Write-Warning "Excel COM not available. CSV created instead: $([System.IO.Path]::ChangeExtension($OutputXlsx, '.csv'))"
+        $csvFallback = [System.IO.Path]::ChangeExtension($OutputXlsx, '.csv')
+        Copy-Item -LiteralPath $tempCsv -Destination $csvFallback -Force
+        Write-Warning "Excel COM not available. CSV created instead: $csvFallback"
     }
     return
 }
-
-# ---------------------------
-# Runspace worker
-# Each worker:
-#   - Imports AzureAD
-#   - Connects with supplied credential
-#   - Gets all members for one group
-#   - Writes one chunk CSV file
-# ---------------------------
 
 $workerScript = {
     param(
@@ -218,7 +190,6 @@ $workerScript = {
         }
     }
     catch {
-        # Write an empty chunk so merge logic stays simple
         [System.IO.File]::WriteAllText($ChunkPath, "", [System.Text.UTF8Encoding]::new($false))
 
         [pscustomobject]@{
@@ -230,10 +201,6 @@ $workerScript = {
         }
     }
 }
-
-# ---------------------------
-# Create runspace pool
-# ---------------------------
 
 $iss = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
 $pool = [runspacefactory]::CreateRunspacePool(1, $ThreadCount, $iss, $Host)
@@ -267,10 +234,6 @@ foreach ($group in $groups) {
     }) | Out-Null
 }
 
-# ---------------------------
-# Collect results as jobs finish
-# ---------------------------
-
 $completed = 0
 $failed = New-Object System.Collections.Generic.List[object]
 
@@ -295,10 +258,6 @@ foreach ($job in $jobs) {
 $pool.Close()
 $pool.Dispose()
 
-# ---------------------------
-# Merge chunk files into one CSV
-# ---------------------------
-
 Write-Host "Merging chunk files..." -ForegroundColor Cyan
 
 Get-ChildItem -LiteralPath $tempDir -File | Sort-Object Name | ForEach-Object {
@@ -306,10 +265,6 @@ Get-ChildItem -LiteralPath $tempDir -File | Sort-Object Name | ForEach-Object {
         Get-Content -LiteralPath $_.FullName -Encoding UTF8 | Add-Content -LiteralPath $tempCsv -Encoding UTF8
     }
 }
-
-# ---------------------------
-# Convert CSV -> XLSX
-# ---------------------------
 
 try {
     Write-Host "Converting CSV to XLSX..." -ForegroundColor Cyan
@@ -323,12 +278,8 @@ catch {
     Write-Warning $_.Exception.Message
 }
 
-# ---------------------------
-# Failure summary
-# ---------------------------
-
 if ($failed.Count -gt 0) {
-    $errorLog = Join-Path $tempRoot 'FailedGroups.csv'
+    $errorLog = Join-Path $resultsFolder 'FailedGroups.csv'
     $failed | Select-Object GroupId, Error | Export-Csv -LiteralPath $errorLog -NoTypeInformation -Encoding UTF8
     Write-Warning "$($failed.Count) groups failed. Failure log: $errorLog"
 }
