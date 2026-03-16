@@ -1,42 +1,8 @@
 #requires -Version 5.1
 
-<#
-.SYNOPSIS
-    Export all security-enabled Azure AD group members to an Excel file (GroupId, MemberId),
-    using ONLY the AzureAD module and runspace-based parallelism.
-
-.NOTES
-    - Optimized for speed with runspace pool parallelism.
-    - Uses AzureAD module only.
-    - Writes a CSV first, then converts to XLSX via Excel COM if Excel is installed.
-    - Best used with a non-MFA account because each parallel worker reconnects to AzureAD.
-
-.PARAMETER TenantId
-    Azure AD tenant ID (GUID).
-
-.PARAMETER OutputXlsx
-    Output XLSX file name. It will always be created in a local .\results folder.
-
-.PARAMETER ThreadCount
-    Number of parallel runspaces. Start with 8, 12, or 16 depending on tenant size and throttling.
-
-.EXAMPLE
-    .\Export-AzureADSecurityGroupMembers.ps1 `
-        -TenantId "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" `
-        -OutputXlsx "AzureAD_SecurityGroupMembers.xlsx" `
-        -ThreadCount 12
-#>
-
 param(
     [Parameter(Mandatory = $true)]
-    [string]$TenantId,
-
-    [Parameter(Mandatory = $true)]
-    [string]$OutputXlsx,
-
-    [Parameter(Mandatory = $false)]
-    [ValidateRange(1, 64)]
-    [int]$ThreadCount = 12
+    [string]$OutputXlsx
 )
 
 Set-StrictMode -Version Latest
@@ -73,17 +39,14 @@ function Convert-CsvToXlsx {
         $worksheet.Name = 'GroupMembers'
 
         $queryTable = $worksheet.QueryTables.Add("TEXT;$CsvPath", $worksheet.Range("A1"))
-        $queryTable.TextFileParseType = 1        # xlDelimited
+        $queryTable.TextFileParseType = 1
         $queryTable.TextFileCommaDelimiter = $true
-        $queryTable.TextFilePlatform = 65001     # UTF-8
+        $queryTable.TextFilePlatform = 65001
         $queryTable.AdjustColumnWidth = $true
         $queryTable.Refresh($false)
         $queryTable.Delete()
 
-        $usedRange = $worksheet.UsedRange
-        $usedRange.EntireColumn.AutoFit() | Out-Null
-
-        # 51 = xlOpenXMLWorkbook (.xlsx)
+        $worksheet.UsedRange.EntireColumn.AutoFit() | Out-Null
         $workbook.SaveAs($XlsxPath, 51)
     }
     finally {
@@ -110,26 +73,37 @@ if (-not (Test-ModuleInstalled -Name 'AzureAD')) {
 
 Import-Module AzureAD -ErrorAction Stop
 
-# Always create a "results" folder where the script is executed
-$resultsFolder = Join-Path -Path (Get-Location) -ChildPath "results"
+# Results folder in current location
+$baseFolder = (Get-Location).Path
+$resultsFolder = Join-Path -Path $baseFolder -ChildPath "results"
 New-Item -ItemType Directory -Path $resultsFolder -Force | Out-Null
 
-# Force output into .\results using only the provided file name
+# Force output into .\results
 $outputFileName = Split-Path -Path $OutputXlsx -Leaf
+if ([string]::IsNullOrWhiteSpace($outputFileName)) {
+    throw "OutputXlsx must contain a valid file name."
+}
 $OutputXlsx = Join-Path -Path $resultsFolder -ChildPath $outputFileName
 
-$tempRoot = Join-Path $env:TEMP ("AzureAD_GroupExport_" + [guid]::NewGuid().Guid)
-$tempCsv  = Join-Path $tempRoot "GroupMembers.csv"
-$tempDir  = Join-Path $tempRoot "Chunks"
+# Safe temp folder
+$tempBase = $env:TEMP
+if ([string]::IsNullOrWhiteSpace($tempBase)) {
+    $tempBase = Join-Path -Path $resultsFolder -ChildPath "temp"
+    New-Item -ItemType Directory -Path $tempBase -Force | Out-Null
+}
+
+$tempRoot = Join-Path -Path $tempBase -ChildPath ("AzureAD_GroupExport_" + [guid]::NewGuid().Guid)
+$tempCsv  = Join-Path -Path $tempRoot -ChildPath "GroupMembers.csv"
 
 New-Item -ItemType Directory -Path $tempRoot -Force | Out-Null
-New-Item -ItemType Directory -Path $tempDir -Force | Out-Null
 
-Write-Host "Prompting for Azure AD credential..." -ForegroundColor Cyan
-$credential = Get-Credential -Message "Enter Azure AD credential for tenant $TenantId"
-
-Write-Host "Connecting to Azure AD in main session..." -ForegroundColor Cyan
-Connect-AzureAD -TenantId $TenantId -Credential $credential | Out-Null
+# Quick check that a session already exists
+try {
+    $null = Get-AzureADTenantDetail
+}
+catch {
+    throw "No active AzureAD session detected. Run Connect-AzureAD first in this Cloud Shell session."
+}
 
 Write-Host "Retrieving all security-enabled groups..." -ForegroundColor Cyan
 $groups = Get-AzureADMSGroup -All $true | Where-Object { $_.SecurityEnabled -eq $true }
@@ -137,133 +111,43 @@ $groups = Get-AzureADMSGroup -All $true | Where-Object { $_.SecurityEnabled -eq 
 $groupCount = @($groups).Count
 Write-Host "Found $groupCount security-enabled groups." -ForegroundColor Green
 
-# Create CSV header
+# Write CSV header
 "GroupId,MemberId" | Set-Content -LiteralPath $tempCsv -Encoding UTF8
 
-if ($groupCount -eq 0) {
-    Write-Host "No security-enabled groups found. Creating empty output." -ForegroundColor Yellow
-    try {
-        Convert-CsvToXlsx -CsvPath $tempCsv -XlsxPath $OutputXlsx
-        Write-Host "Done: $OutputXlsx" -ForegroundColor Green
-    }
-    catch {
-        $csvFallback = [System.IO.Path]::ChangeExtension($OutputXlsx, '.csv')
-        Copy-Item -LiteralPath $tempCsv -Destination $csvFallback -Force
-        Write-Warning "Excel COM not available. CSV created instead: $csvFallback"
-    }
-    return
-}
-
-$workerScript = {
-    param(
-        [string]$TenantId,
-        [pscredential]$Credential,
-        [string]$GroupId,
-        [string]$ChunkPath
-    )
-
-    $ErrorActionPreference = 'Stop'
-    Import-Module AzureAD -ErrorAction Stop
-
-    Connect-AzureAD -TenantId $TenantId -Credential $Credential | Out-Null
-
-    $sb = New-Object System.Text.StringBuilder
-
-    try {
-        $members = Get-AzureADGroupMember -ObjectId $GroupId -All $true
-
-        foreach ($member in $members) {
-            [void]$sb.Append($GroupId)
-            [void]$sb.Append(',')
-            [void]$sb.Append($member.ObjectId)
-            [void]$sb.AppendLine()
-        }
-
-        [System.IO.File]::WriteAllText($ChunkPath, $sb.ToString(), [System.Text.UTF8Encoding]::new($false))
-
-        [pscustomobject]@{
-            GroupId     = $GroupId
-            Success     = $true
-            MemberCount = @($members).Count
-            ChunkPath   = $ChunkPath
-            Error       = $null
-        }
-    }
-    catch {
-        [System.IO.File]::WriteAllText($ChunkPath, "", [System.Text.UTF8Encoding]::new($false))
-
-        [pscustomobject]@{
-            GroupId     = $GroupId
-            Success     = $false
-            MemberCount = 0
-            ChunkPath   = $ChunkPath
-            Error       = $_.Exception.Message
-        }
-    }
-}
-
-$iss = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
-$pool = [runspacefactory]::CreateRunspacePool(1, $ThreadCount, $iss, $Host)
-$pool.Open()
-
-$jobs = New-Object System.Collections.Generic.List[object]
-
-Write-Host "Starting parallel member collection with $ThreadCount threads..." -ForegroundColor Cyan
-
-$index = 0
-foreach ($group in $groups) {
-    $index++
-    $chunkPath = Join-Path $tempDir ("chunk_{0:D8}.csv" -f $index)
-
-    $ps = [powershell]::Create()
-    $ps.RunspacePool = $pool
-
-    [void]$ps.AddScript($workerScript).
-        AddArgument($TenantId).
-        AddArgument($credential).
-        AddArgument($group.Id).
-        AddArgument($chunkPath)
-
-    $handle = $ps.BeginInvoke()
-
-    $jobs.Add([pscustomobject]@{
-        PowerShell = $ps
-        Handle     = $handle
-        GroupId    = $group.Id
-        ChunkPath  = $chunkPath
-    }) | Out-Null
-}
-
-$completed = 0
+$lineBuffer = New-Object System.Collections.Generic.List[string]
+$flushThreshold = 5000
+$processed = 0
 $failed = New-Object System.Collections.Generic.List[object]
 
-foreach ($job in $jobs) {
+foreach ($group in $groups) {
     try {
-        $result = $job.PowerShell.EndInvoke($job.Handle)
-        $completed++
+        $members = Get-AzureADGroupMember -ObjectId $group.Id -All $true
 
-        if (-not $result.Success) {
-            $failed.Add($result) | Out-Null
+        foreach ($member in $members) {
+            $lineBuffer.Add("$($group.Id),$($member.ObjectId)")
         }
 
-        if (($completed % 100) -eq 0 -or $completed -eq $groupCount) {
-            Write-Host ("Completed {0}/{1} groups..." -f $completed, $groupCount) -ForegroundColor DarkCyan
+        if ($lineBuffer.Count -ge $flushThreshold) {
+            Add-Content -LiteralPath $tempCsv -Value $lineBuffer -Encoding UTF8
+            $lineBuffer.Clear()
         }
     }
-    finally {
-        $job.PowerShell.Dispose()
+    catch {
+        $failed.Add([pscustomobject]@{
+            GroupId = $group.Id
+            Error   = $_.Exception.Message
+        }) | Out-Null
+    }
+
+    $processed++
+    if (($processed % 100) -eq 0 -or $processed -eq $groupCount) {
+        Write-Host ("Completed {0}/{1} groups..." -f $processed, $groupCount) -ForegroundColor DarkCyan
     }
 }
 
-$pool.Close()
-$pool.Dispose()
-
-Write-Host "Merging chunk files..." -ForegroundColor Cyan
-
-Get-ChildItem -LiteralPath $tempDir -File | Sort-Object Name | ForEach-Object {
-    if ($_.Length -gt 0) {
-        Get-Content -LiteralPath $_.FullName -Encoding UTF8 | Add-Content -LiteralPath $tempCsv -Encoding UTF8
-    }
+if ($lineBuffer.Count -gt 0) {
+    Add-Content -LiteralPath $tempCsv -Value $lineBuffer -Encoding UTF8
+    $lineBuffer.Clear()
 }
 
 try {
@@ -279,8 +163,8 @@ catch {
 }
 
 if ($failed.Count -gt 0) {
-    $errorLog = Join-Path $resultsFolder 'FailedGroups.csv'
-    $failed | Select-Object GroupId, Error | Export-Csv -LiteralPath $errorLog -NoTypeInformation -Encoding UTF8
+    $errorLog = Join-Path -Path $resultsFolder -ChildPath 'FailedGroups.csv'
+    $failed | Export-Csv -LiteralPath $errorLog -NoTypeInformation -Encoding UTF8
     Write-Warning "$($failed.Count) groups failed. Failure log: $errorLog"
 }
 else {
